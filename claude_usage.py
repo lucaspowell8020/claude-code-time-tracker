@@ -213,7 +213,8 @@ def iter_events(base: str):
                     if isinstance(msg, dict):
                         u = msg.get("usage")
                         if isinstance(u, dict):
-                            usage = (model_tier(msg.get("model")), u)
+                            model_raw = msg.get("model") or "unknown"
+                            usage = (model_tier(model_raw), model_raw, u)
                     yield sid, proj, ts, usage
         except (OSError, UnicodeDecodeError):
             continue
@@ -226,12 +227,17 @@ def aggregate(base: str):
         "seconds": 0.0, "out_tokens": 0, "total_tokens": 0,
         "cost": 0.0, "msgs": 0, "sessions": set(),
     })
+    # Per-model totals. Active time / Saved A are NOT tracked here — a model only
+    # appears on assistant events, so idle-gap time can't be attributed to one.
+    by_model = defaultdict(lambda: {
+        "out_tokens": 0, "total_tokens": 0, "cost": 0.0, "msgs": 0, "sessions": set(),
+    })
 
     for sid, proj, ts, usage in iter_events(base):
         sessions[sid].append((ts, proj, usage))
 
     if not sessions:
-        return [], None, None
+        return [], [], None, None
 
     all_dates = []
     cap = CONFIG["idle_cap_seconds"]
@@ -243,16 +249,24 @@ def aggregate(base: str):
             rec["sessions"].add(sid)
             all_dates.append(ts.date())
             if usage is not None:
-                tier, u = usage
-                rec["msgs"] += 1
-                rec["out_tokens"] += u.get("output_tokens", 0)
-                rec["total_tokens"] += (
+                tier, model_raw, u = usage
+                total = (
                     u.get("input_tokens", 0)
                     + u.get("cache_creation_input_tokens", 0)
                     + u.get("cache_read_input_tokens", 0)
                     + u.get("output_tokens", 0)
                 )
-                rec["cost"] += cost_for(tier, u)
+                c = cost_for(tier, u)
+                rec["msgs"] += 1
+                rec["out_tokens"] += u.get("output_tokens", 0)
+                rec["total_tokens"] += total
+                rec["cost"] += c
+                m = by_model[model_raw]
+                m["msgs"] += 1
+                m["out_tokens"] += u.get("output_tokens", 0)
+                m["total_tokens"] += total
+                m["cost"] += c
+                m["sessions"].add(sid)
         for (ts0, proj0, _), (ts1, _p, _u) in zip(events, events[1:]):
             gap = (ts1 - ts0).total_seconds()
             if gap <= 0:
@@ -272,7 +286,23 @@ def aggregate(base: str):
             "sessions": len(rec["sessions"]),
         })
     records.sort(key=lambda r: (r["date"], r["project"]))
-    return records, min(all_dates), max(all_dates)
+
+    models = []
+    for model_raw, m in by_model.items():
+        # Skip models with no real token usage (e.g. Claude Code's <synthetic>
+        # locally-generated messages, which never hit the API).
+        if m["total_tokens"] <= 0:
+            continue
+        models.append({
+            "model": model_raw,
+            "out_tokens": m["out_tokens"],
+            "total_tokens": m["total_tokens"],
+            "cost": round(m["cost"], 4),
+            "msgs": m["msgs"],
+            "sessions": len(m["sessions"]),
+        })
+    models.sort(key=lambda r: -r["cost"])
+    return records, models, min(all_dates), max(all_dates)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -367,6 +397,13 @@ h1{font-family:"Fraunces",Georgia,serif;font-weight:500;color:var(--ink);
   cursor:pointer;min-height:44px;}
 .seg button+button{border-left:1px solid var(--ink);}
 .seg button.on{background:var(--ink);color:var(--paper);}
+.filter{font-family:"IBM Plex Mono",monospace;font-size:14px;color:var(--ink-muted);
+  display:inline-flex;align-items:center;gap:10px;}
+.filter b{color:var(--ink);font-weight:500;}
+.filter button{border:1px solid var(--rule);background:var(--paper);color:var(--accent);
+  font-family:inherit;font-size:13px;cursor:pointer;padding:5px 10px;min-height:auto;
+  text-transform:uppercase;letter-spacing:0.06em;}
+.filter button:hover{border-color:var(--accent);}
 .sectitle{font-family:"Fraunces",serif;font-size:24px;font-weight:500;color:var(--ink);margin:40px 0 4px;}
 .note{font-size:14px;color:var(--ink-muted);margin:0 0 20px;}
 .chartcard{border:1px solid var(--rule);background:var(--paper);padding:24px;}
@@ -386,6 +423,10 @@ td{padding:12px 14px;border-bottom:1px solid var(--rule);text-align:right;
 tr:last-child td{border-bottom:1px solid var(--ink);}
 tbody tr:hover{background:var(--paper-dark);}
 td.proj{color:var(--ink);font-weight:500;}
+#ptable tbody tr{cursor:pointer;}
+#ptable tbody tr.sel{background:var(--paper-dark);}
+#ptable tbody tr.sel td.proj{color:var(--accent);}
+#ptable tbody tr.sel td.proj::before{content:"\2192\00a0";color:var(--accent);}
 tfoot td{font-weight:600;color:var(--ink);border-bottom:0;}
 .method{background:var(--paper-dark);border:1px solid var(--rule);padding:20px 24px;margin-top:40px;}
 .method h3{font-family:"IBM Plex Mono",monospace;font-size:14px;text-transform:uppercase;
@@ -407,13 +448,15 @@ tfoot td{font-weight:600;color:var(--ink);border-bottom:0;}
   <div class="rule"></div>
 
   <h2 class="sectitle">Active time over time</h2>
-  <p class="note">Engaged minutes per period, idle gaps excluded. Switch granularity below.</p>
+  <p class="note">Engaged hours per period, idle gaps excluded. Switch granularity below, and
+    click a project in the table further down to filter this chart to it.</p>
   <div class="toolbar">
     <div class="seg" id="seg">
       <button data-g="day">Daily</button>
       <button data-g="week" class="on">Weekly</button>
       <button data-g="month">Monthly</button>
     </div>
+    <span class="filter" id="filter"></span>
   </div>
   <div class="chartcard"><div id="chart"></div></div>
 
@@ -423,6 +466,18 @@ tfoot td{font-weight:600;color:var(--ink);border-bottom:0;}
     <thead><tr>
       <th>Project</th><th>Active h</th><th>Sessions</th><th>Out tokens</th>
       <th>Est $</th><th>Saved A</th><th>Saved B</th>
+    </tr></thead>
+    <tbody></tbody>
+    <tfoot></tfoot>
+  </table>
+
+  <h2 class="sectitle">By model</h2>
+  <p class="note">Token, cost, and message totals per Claude model. Active time and Saved&nbsp;A
+    aren't shown here — they can't be attributed to a single model (see methodology).</p>
+  <table id="mtable">
+    <thead><tr>
+      <th>Model</th><th>Sessions</th><th>Messages</th><th>Out tokens</th>
+      <th>Total tokens</th><th>Est $</th><th>Saved B</th>
     </tr></thead>
     <tbody></tbody>
     <tfoot></tfoot>
@@ -467,6 +522,14 @@ function fmtTokens(n){
   if(n>=1e3) return (n/1e3).toFixed(1)+"k";
   return ""+n;
 }
+function prettyModel(m){
+  if(!m || m==="unknown") return "unknown";
+  let s = m.replace(/^claude-/,"").replace(/-\d{8}$/,"");
+  const parts = s.split("-");
+  const fam = parts[0].charAt(0).toUpperCase()+parts[0].slice(1);
+  const ver = parts.slice(1).join(".");
+  return ver ? fam+" "+ver : fam;
+}
 
 function renderTotals(){
   const byProj = {};
@@ -478,20 +541,23 @@ function renderTotals(){
   }
   const H=T.min/60;
   const kpis=[
-    ["Active time", fmt(H,1), "h"],
-    ["Saved &middot; A", fmt(H*MULT,0), "h"],
-    ["Saved &middot; B", fmt(T.out/THRU,0), "h"],
-    ["Sessions", fmt(T.sess,0), ""],
-    ["Tokens", fmtTokens(T.tot), ""],
-    ["Est. value", "$"+fmt(T.cost,0), ""],
+    ["Active time", fmt(H,1), "h", "Engaged time, idle gaps over the cap excluded."],
+    ["Saved &middot; A", fmt(H*MULT,0), "h", "Active hours × the time multiplier."],
+    ["Saved &middot; B", fmt(T.out/THRU,0), "h", "Output tokens ÷ human throughput. Reads high — see methodology."],
+    ["Sessions", fmt(T.sess,0), "", "Distinct Claude Code sessions."],
+    ["Generated", fmtTokens(T.out), "", "Output tokens Claude actually produced — code, text, tool calls."],
+    ["Tokens processed", fmtTokens(T.tot), "", "All tokens handled across every API call. Most are cache re-reads of prior context (billed at 0.1×), not new content."],
+    ["Est. value", "$"+fmt(T.cost,0), "", "API list-price equivalent of tokens used — not your subscription bill."],
   ];
   document.getElementById("kpis").innerHTML = kpis.map(k=>
-    `<div class="kpi"><p class="label">${k[0]}</p><div class="val">${k[1]}<span class="unit">${k[2]}</span></div></div>`).join("");
+    `<div class="kpi"${k[3]?` title="${k[3]}"`:""}><p class="label">${k[0]}</p><div class="val">${k[1]}<span class="unit">${k[2]}</span></div></div>`).join("");
 
   const rows = Object.entries(byProj).sort((a,b)=>b[1].min-a[1].min);
   document.querySelector("#ptable tbody").innerHTML = rows.map(([proj,p])=>{
     const h=p.min/60;
-    return `<tr><td class="proj">${proj}</td><td>${fmt(h,1)}</td><td>${fmt(p.sess,0)}</td>`+
+    const sel = proj===curProject ? ' class="sel"' : '';
+    return `<tr${sel} data-project="${proj.replace(/"/g,'&quot;')}">`+
+      `<td class="proj">${proj}</td><td>${fmt(h,1)}</td><td>${fmt(p.sess,0)}</td>`+
       `<td>${fmtTokens(p.out)}</td><td>$${fmt(p.cost,2)}</td>`+
       `<td>${fmt(h*MULT,1)}</td><td>${fmt(p.out/THRU,1)}</td></tr>`;
   }).join("");
@@ -501,9 +567,29 @@ function renderTotals(){
     `<td>${fmt(H*MULT,1)}</td><td>${fmt(T.out/THRU,1)}</td></tr>`;
 }
 
-function renderChart(g){
+function renderModels(){
+  const rows = (DATA.models||[]).slice().sort((a,b)=>b.cost-a.cost);
+  let T={out:0,total:0,cost:0,msgs:0,sess:0};
+  for(const m of rows){ T.out+=m.out_tokens; T.total+=m.total_tokens; T.cost+=m.cost; T.msgs+=m.msgs; T.sess+=m.sessions; }
+  document.querySelector("#mtable tbody").innerHTML = rows.map(m=>
+    `<tr><td class="proj" title="${m.model}">${prettyModel(m.model)}</td>`+
+    `<td>${fmt(m.sessions,0)}</td><td>${fmt(m.msgs,0)}</td>`+
+    `<td>${fmtTokens(m.out_tokens)}</td><td>${fmtTokens(m.total_tokens)}</td>`+
+    `<td>$${fmt(m.cost,2)}</td><td>${fmt(m.out_tokens/THRU,1)}</td></tr>`).join("");
+  document.querySelector("#mtable tfoot").innerHTML =
+    `<tr><td>TOTAL</td><td>${fmt(T.sess,0)}</td><td>${fmt(T.msgs,0)}</td>`+
+    `<td>${fmtTokens(T.out)}</td><td>${fmtTokens(T.total)}</td>`+
+    `<td>$${fmt(T.cost,2)}</td><td>${fmt(T.out/THRU,1)}</td></tr>`;
+}
+
+let curG = "week";
+let curProject = null;
+
+function renderChart(){
+  const g = curG;
+  const recs = curProject ? DATA.records.filter(r=>r.project===curProject) : DATA.records;
   const buckets = {};
-  for(const r of DATA.records){
+  for(const r of recs){
     const k = bucketKey(r.date,g);
     buckets[k] = (buckets[k]||0) + r.minutes/60;
   }
@@ -546,13 +632,40 @@ document.getElementById("sub").textContent =
 document.getElementById("foot").innerHTML =
   `Read from ${DATA.files} local transcript files. Nothing was uploaded. `+
   `Re-run <code>claude_usage.py</code> to refresh.`;
+function renderFilter(){
+  const el = document.getElementById("filter");
+  if(curProject){
+    el.innerHTML = `<span>Filtered to <b>${curProject}</b></span>`+
+      `<button id="clearfilter">Clear &times;</button>`;
+    document.getElementById("clearfilter").addEventListener("click",()=>setProject(null));
+  } else {
+    el.innerHTML = "";
+  }
+}
+function setProject(p){
+  curProject = (p===curProject) ? null : p;
+  document.querySelectorAll("#ptable tbody tr").forEach(tr=>{
+    tr.classList.toggle("sel", tr.dataset.project===curProject);
+  });
+  renderFilter();
+  renderChart();
+}
+
 renderTotals();
-renderChart("week");
+renderModels();
+renderChart();
+renderFilter();
+
+document.querySelector("#ptable tbody").addEventListener("click",e=>{
+  const tr = e.target.closest("tr[data-project]");
+  if(tr) setProject(tr.dataset.project);
+});
 document.querySelectorAll("#seg button").forEach(b=>{
   b.addEventListener("click",()=>{
     document.querySelectorAll("#seg button").forEach(x=>x.classList.remove("on"));
     b.classList.add("on");
-    renderChart(b.dataset.g);
+    curG = b.dataset.g;
+    renderChart();
   });
 });
 </script>
@@ -561,10 +674,11 @@ document.querySelectorAll("#seg button").forEach(b=>{
 """
 
 
-def build_html(records, dmin, dmax, file_count):
+def build_html(records, models, dmin, dmax, file_count):
     generated = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
     data = {
         "records": records,
+        "models": models,
         "range": [dmin.isoformat() if dmin else "—", dmax.isoformat() if dmax else "—"],
         "generated": generated,
         "files": file_count,
@@ -600,12 +714,12 @@ def main():
         sys.exit(1)
 
     file_count = len(glob.glob(os.path.join(args.base, "**", "*.jsonl"), recursive=True))
-    records, dmin, dmax = aggregate(args.base)
+    records, models, dmin, dmax = aggregate(args.base)
     if not records:
         print("No usage events found under " + args.base, file=sys.stderr)
         sys.exit(1)
 
-    html = build_html(records, dmin, dmax, file_count)
+    html = build_html(records, models, dmin, dmax, file_count)
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(html)
 
