@@ -1,0 +1,18 @@
+# Generated dashboard — contains YOUR real project names and usage. Never commit.
+usage_dashboard.html
+*.dashboard.html
+
+# Personal config (copy the .example.json and edit). Keep yours private.
+claude_usage.config.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
