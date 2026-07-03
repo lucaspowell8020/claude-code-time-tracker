@@ -5,6 +5,9 @@
   "time_multiplier": 4.0,
   "human_throughput_tokens_per_hour": 1500,
 
+  "_timezone_help": "Day/week/month buckets use this zone. null = your machine's local time. Or an IANA name like 'America/Chicago', 'America/New_York', 'Europe/London' (Windows may need: pip install tzdata).",
+  "timezone": null,
+
   "container_dirs": ["dev", "projects", "repos", "src", "code", "work", "workspace", "sites"],
 
   "project_rules": [
@@ -22,5 +25,13 @@
   },
   "default_model_tier": "sonnet",
   "cache_write_mult": 1.25,
-  "cache_read_mult": 0.10
+  "cache_read_mult": 0.10,
+
+  "_plan_help": "Your Claude subscription, for the plan check: 'pro', 'max_5x', 'max_20x', 'api', or null for no keep/switch verdict. Override per run with --plan.",
+  "plan": null,
+  "plan_prices": {
+    "pro": 20.0,
+    "max_5x": 100.0,
+    "max_20x": 200.0
+  }
 }

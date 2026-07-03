@@ -9,6 +9,11 @@ reports, per project:
   - estimated API-equivalent cost
   - estimated labor hours saved (two methods, shown side by side)
 
+It also runs a plan check: your last 30 days of API-equivalent consumption
+against the Claude subscription tiers (Pro / Max 5x / Max 20x / raw API),
+with a keep / upgrade / downgrade verdict and a downloadable, privacy-safe
+share card (totals only — no project names).
+
 Outputs an interactive HTML dashboard (daily / weekly / monthly) and a
 terminal summary for the current week.
 
@@ -79,6 +84,13 @@ DEFAULTS = {
     # Label used when a project can't be determined.
     "unknown_project": "(unknown)",
 
+    # Timezone used to bucket events into days/weeks/months. Transcripts store
+    # UTC; without this, late-evening work lands on the next UTC day. null = use
+    # this machine's local timezone (recommended). Or set an IANA name like
+    # "America/Chicago" to pin a zone (needs the standard tz database; on Windows
+    # run `pip install tzdata` if a named zone isn't found).
+    "timezone": None,
+
     # Model pricing, USD per 1,000,000 tokens. Anthropic list prices (2026-06).
     # Cache-write (5-min TTL) billed at cache_write_mult x input; cache-read at
     # cache_read_mult x input.
@@ -91,10 +103,49 @@ DEFAULTS = {
     "default_model_tier": "sonnet",
     "cache_write_mult": 1.25,   # use 2.0 if you run 1-hour-TTL caching
     "cache_read_mult": 0.10,
+
+    # Your Claude subscription, for the plan check. One of: "pro", "max_5x",
+    # "max_20x", "api" (pay-as-you-go), or null for no keep/switch verdict
+    # (the tier table still renders). Override per run with --plan.
+    "plan": None,
+
+    # Subscription list prices, USD/month (2026-06). Edit if they drift.
+    "plan_prices": {
+        "pro": 20.0,
+        "max_5x": 100.0,
+        "max_20x": 200.0,
+    },
 }
 
-# Populated by load_config() before aggregation runs.
+# Populated by load_config() / resolve_tz() before aggregation runs.
 CONFIG = dict(DEFAULTS)
+TZ = None  # tzinfo used for date bucketing; None = system local time
+
+
+def resolve_tz(name):
+    """Return a tzinfo for `name` (IANA string), or None to mean system local."""
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception as e:  # ZoneInfoNotFoundError, missing tzdata, etc.
+        print(f"Warning: timezone {name!r} unavailable ({type(e).__name__}); "
+              f"using system local time. On Windows, `pip install tzdata` enables "
+              f"named zones.", file=sys.stderr)
+        return None
+
+
+def tz_label() -> str:
+    """Human-readable label for the active timezone (e.g. 'CDT' or the IANA name)."""
+    if CONFIG.get("timezone"):
+        return str(CONFIG["timezone"])
+    return datetime.now(timezone.utc).astimezone(TZ).tzname() or "local time"
+
+
+def local_date(dt) -> str:
+    """ISO date of `dt` in the active timezone."""
+    return dt.astimezone(TZ).date().isoformat()
 
 
 def load_config(path: str | None) -> dict:
@@ -168,6 +219,16 @@ def project_for(cwd: str | None) -> str:
     return chosen
 
 
+def _msg_text(msg: dict) -> str:
+    """Plain text of a message's content (string or block-list form)."""
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+    return ""
+
+
 def parse_ts(ts: str) -> datetime | None:
     if not ts:
         return None
@@ -190,7 +251,7 @@ def cost_for(tier: str, usage: dict) -> float:
 
 
 def iter_events(base: str):
-    """Yield (session_id, project, datetime, usage_tuple_or_None) per event."""
+    """Yield (session_id, project, datetime, usage_tuple_or_None, limit_hit) per event."""
     files = glob.glob(os.path.join(base, "**", "*.jsonl"), recursive=True)
     for path in files:
         try:
@@ -209,13 +270,18 @@ def iter_events(base: str):
                     sid = o.get("sessionId") or os.path.basename(path)
                     proj = project_for(o.get("cwd"))
                     usage = None
+                    limit_hit = False
                     msg = o.get("message")
                     if isinstance(msg, dict):
+                        model_raw = msg.get("model") or "unknown"
+                        # Claude Code writes limit notices as locally-generated
+                        # "<synthetic>" assistant messages ("...limit reached...").
+                        if model_raw == "<synthetic>" and "limit reached" in _msg_text(msg).lower():
+                            limit_hit = True
                         u = msg.get("usage")
                         if isinstance(u, dict):
-                            model_raw = msg.get("model") or "unknown"
                             usage = (model_tier(model_raw), model_raw, u)
-                    yield sid, proj, ts, usage
+                    yield sid, proj, ts, usage, limit_hit
         except (OSError, UnicodeDecodeError):
             continue
 
@@ -233,11 +299,14 @@ def aggregate(base: str):
         "out_tokens": 0, "total_tokens": 0, "cost": 0.0, "msgs": 0, "sessions": set(),
     })
 
-    for sid, proj, ts, usage in iter_events(base):
+    limit_dates: list[str] = []
+    for sid, proj, ts, usage, limit_hit in iter_events(base):
         sessions[sid].append((ts, proj, usage))
+        if limit_hit:
+            limit_dates.append(local_date(ts))
 
     if not sessions:
-        return [], [], None, None
+        return [], [], None, None, []
 
     all_dates = []
     cap = CONFIG["idle_cap_seconds"]
@@ -245,9 +314,10 @@ def aggregate(base: str):
     for sid, events in sessions.items():
         events.sort(key=lambda e: e[0])
         for ts, proj, usage in events:
-            rec = daily[(ts.date().isoformat(), proj)]
+            d = ts.astimezone(TZ).date()
+            rec = daily[(d.isoformat(), proj)]
             rec["sessions"].add(sid)
-            all_dates.append(ts.date())
+            all_dates.append(d)
             if usage is not None:
                 tier, model_raw, u = usage
                 total = (
@@ -271,7 +341,7 @@ def aggregate(base: str):
             gap = (ts1 - ts0).total_seconds()
             if gap <= 0:
                 continue
-            daily[(ts0.date().isoformat(), proj0)]["seconds"] += min(gap, cap)
+            daily[(local_date(ts0), proj0)]["seconds"] += min(gap, cap)
 
     records = []
     for (date_iso, proj), rec in daily.items():
@@ -302,7 +372,128 @@ def aggregate(base: str):
             "sessions": len(m["sessions"]),
         })
     models.sort(key=lambda r: -r["cost"])
-    return records, models, min(all_dates), max(all_dates)
+    return records, models, min(all_dates), max(all_dates), limit_dates
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plan check
+# ─────────────────────────────────────────────────────────────────────────────
+
+PLAN_ORDER = ["api", "pro", "max_5x", "max_20x"]
+PLAN_LABELS = {"api": "API pay-as-you-go", "pro": "Pro", "max_5x": "Max 5x", "max_20x": "Max 20x"}
+
+
+def fit_tier(monthly: float, hits: int, prices: dict) -> str:
+    """Heuristic best-fit tier from monthly API-equivalent spend + limit hits.
+
+    Dollar bands are heuristics (subscription quotas aren't published as
+    dollar figures); limit hits are the ground truth — hitting them on 3+
+    days in the window bumps the fit one tier up.
+    """
+    if monthly < prices["pro"]:
+        fit = "api"
+    elif monthly < prices["max_5x"]:
+        fit = "pro"
+    elif monthly < 4 * prices["max_5x"]:
+        fit = "max_5x"
+    else:
+        fit = "max_20x"
+    if hits >= 3 and fit != "max_20x":
+        fit = PLAN_ORDER[PLAN_ORDER.index(fit) + 1]
+    return fit
+
+
+def build_plan_report(records, dmin, dmax, limit_dates) -> dict:
+    """30-day window: API-equivalent consumption vs the subscription tiers."""
+    prices = CONFIG["plan_prices"]
+    end = dmax
+    start = max(dmin, end - timedelta(days=29))
+    days = (end - start).days + 1
+    s, e = start.isoformat(), end.isoformat()
+    win = [r for r in records if s <= r["date"] <= e]
+    cost = sum(r["cost"] for r in win)
+    minutes = sum(r["minutes"] for r in win)
+    sessions = sum(r["sessions"] for r in win)
+    out_tokens = sum(r["out_tokens"] for r in win)
+    monthly = cost / days * 30.0 if days else 0.0
+    hits = sum(1 for d in set(limit_dates) if s <= d <= e)
+
+    plan = CONFIG.get("plan") or None
+    if plan is not None and plan not in PLAN_ORDER:
+        print(f"Warning: unknown plan {plan!r} in config; expected one of "
+              f"{PLAN_ORDER}. Ignoring.", file=sys.stderr)
+        plan = None
+    fit = fit_tier(monthly, hits, prices)
+    plan_price = prices.get(plan, 0.0) if plan else 0.0
+    mult = (monthly / plan_price) if plan_price else 0.0
+
+    limit_note = (f" You hit usage limits on {hits} day{'s' if hits != 1 else ''} "
+                  f"in the window." if hits else "")
+
+    if plan is None:
+        verdict = f"~${monthly:,.0f}/month of API-equivalent compute."
+        detail = (f"Best-fit plan on these numbers: {PLAN_LABELS[fit]}.{limit_note} "
+                  f'Set "plan" in config (or pass --plan) for a keep/switch verdict.')
+    elif plan == "api":
+        if fit == "api":
+            verdict = "API pay-as-you-go is the right call."
+            detail = (f"~${monthly:,.0f}/month at list prices sits below the "
+                      f"${prices['pro']:,.0f} Pro sticker. A subscription only wins "
+                      f"if you want the apps and flat billing.")
+        else:
+            verdict = f"Switch candidate: {PLAN_LABELS[fit]}."
+            detail = (f"You're consuming ~${monthly:,.0f}/month at list prices; "
+                      f"{PLAN_LABELS[fit]} at ${prices[fit]:,.0f}/month caps that spend.{limit_note}")
+    else:
+        pi, fi = PLAN_ORDER.index(plan), PLAN_ORDER.index(fit)
+        if fi > pi:
+            verdict = f"Upgrade candidate: {PLAN_LABELS[fit]}."
+            detail = (f"~${monthly:,.0f}/month of compute against a "
+                      f"${plan_price:,.0f}/month plan ({mult:.1f}x the sticker).{limit_note}")
+        elif fi < pi and mult < 0.8:
+            down = PLAN_LABELS[fit] if fit != "api" else "the raw API"
+            verdict = f"Downgrade candidate: {down}."
+            detail = (f"~${monthly:,.0f}/month of compute doesn't fill a "
+                      f"${plan_price:,.0f}/month plan. "
+                      + (f"{PLAN_LABELS[fit]} covers this usage."
+                         if fit != "api" else
+                         f"Pay-as-you-go would run about ${monthly:,.0f}/month."))
+        else:
+            verdict = f"Keep {PLAN_LABELS[plan]}."
+            detail = (f"You consumed ~${monthly:,.0f}/month of API-equivalent compute "
+                      f"on a ${plan_price:,.0f}/month plan: {mult:.1f}x the sticker.{limit_note}")
+
+    tiers = [{"key": "api", "label": PLAN_LABELS["api"], "price": 0}]
+    tiers += [{"key": k, "label": PLAN_LABELS[k], "price": prices[k]}
+              for k in ("pro", "max_5x", "max_20x")]
+
+    return {
+        "window": [s, e], "days": days,
+        "cost": round(cost, 2), "monthly": round(monthly, 2),
+        "active_h": round(minutes / 60.0, 1),
+        "saved_a": round(minutes / 60.0 * CONFIG["time_multiplier"], 1),
+        "sessions": sessions, "out_tokens": out_tokens, "hits": hits,
+        "plan": plan, "plan_label": PLAN_LABELS.get(plan, ""), "plan_price": plan_price,
+        "mult": round(mult, 2), "fit": fit, "fit_label": PLAN_LABELS[fit],
+        "verdict": verdict, "detail": detail, "tiers": tiers,
+    }
+
+
+def print_plan_check(pr: dict):
+    print(f"  Plan check -- {pr['window'][0]} -> {pr['window'][1]} ({pr['days']} days)")
+    print("  " + "-" * 78)
+    print(f"  API-equivalent compute: ${pr['cost']:,.2f} in the window "
+          f"(~${pr['monthly']:,.0f}/month)")
+    if pr["plan"]:
+        label = pr["plan_label"]
+        price = f"${pr['plan_price']:,.0f}/mo" if pr["plan_price"] else "metered"
+        mult = f" -- {pr['mult']:.1f}x the sticker" if pr["plan_price"] else ""
+        print(f"  Your plan: {label} ({price}){mult}")
+    if pr["hits"]:
+        print(f"  Usage-limit days: {pr['hits']}")
+    print(f"  Verdict: {pr['verdict']}")
+    print(f"  {pr['detail']}")
+    print()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -413,6 +604,10 @@ svg{display:block;width:100%;height:auto;font-family:"IBM Plex Mono",monospace;}
 .axis{stroke:var(--rule);stroke-width:1;}
 .tick{fill:var(--ink-muted);font-size:11px;}
 .barlbl{fill:var(--ink-muted);font-size:11px;}
+.tokline{fill:none;stroke:var(--accent);stroke-width:2;}
+.tokdot{fill:var(--accent);}
+.seglabel{font-family:"IBM Plex Mono",monospace;font-size:14px;text-transform:uppercase;
+  letter-spacing:0.06em;color:var(--ink-muted);}
 table{width:100%;border-collapse:collapse;margin-top:8px;font-size:16px;}
 th{font-family:"IBM Plex Mono",monospace;font-size:14px;text-transform:uppercase;
   letter-spacing:0.06em;color:var(--ink-muted);text-align:right;padding:12px 14px;
@@ -428,6 +623,17 @@ td.proj{color:var(--ink);font-weight:500;}
 #ptable tbody tr.sel td.proj{color:var(--accent);}
 #ptable tbody tr.sel td.proj::before{content:"\2192\00a0";color:var(--accent);}
 tfoot td{font-weight:600;color:var(--ink);border-bottom:0;}
+.plancard{border:1px solid var(--rule);background:var(--paper);padding:24px;}
+.verdict{font-family:"Fraunces",serif;font-size:28px;font-weight:500;color:var(--ink);margin:0 0 6px;}
+.vdetail{font-size:16px;color:var(--ink-soft);margin:0 0 8px;}
+.tag{font-family:"IBM Plex Mono",monospace;font-size:14px;text-transform:uppercase;
+  letter-spacing:0.06em;border:1px solid var(--rule);color:var(--ink-muted);
+  padding:3px 8px;white-space:nowrap;}
+.tag.best{border-color:var(--accent);color:var(--accent);}
+.dlbtn{font-family:"IBM Plex Mono",monospace;font-size:14px;text-transform:uppercase;
+  letter-spacing:0.08em;background:var(--ink);color:var(--paper);border:0;
+  padding:12px 24px;min-height:44px;cursor:pointer;}
+.dlbtn:hover{background:var(--accent);}
 .method{background:var(--paper-dark);border:1px solid var(--rule);padding:20px 24px;margin-top:40px;}
 .method h3{font-family:"IBM Plex Mono",monospace;font-size:14px;text-transform:uppercase;
   letter-spacing:0.08em;color:var(--accent);margin:0 0 12px;}
@@ -456,6 +662,11 @@ tfoot td{font-weight:600;color:var(--ink);border-bottom:0;}
       <button data-g="week" class="on">Weekly</button>
       <button data-g="month">Monthly</button>
     </div>
+    <span class="seglabel">tokens</span>
+    <div class="seg" id="tokseg">
+      <button data-t="out" class="on">Output</button>
+      <button data-t="total">Total</button>
+    </div>
     <span class="filter" id="filter"></span>
   </div>
   <div class="chartcard"><div id="chart"></div></div>
@@ -483,6 +694,21 @@ tfoot td{font-weight:600;color:var(--ink);border-bottom:0;}
     <tfoot></tfoot>
   </table>
 
+  <h2 class="sectitle">Plan check</h2>
+  <p class="note" id="plannote"></p>
+  <div class="plancard" id="plancard"></div>
+
+  <h2 class="sectitle">Share card</h2>
+  <p class="note">A privacy-safe summary image &mdash; totals only, no project names.
+    Download it and post it.</p>
+  <div class="chartcard">
+    <canvas id="sharecanvas" width="1200" height="630"
+      style="width:100%;height:auto;display:block;border:1px solid var(--rule);"></canvas>
+    <div style="margin-top:16px;">
+      <button class="dlbtn" id="dlcard">Download PNG</button>
+    </div>
+  </div>
+
   <div class="method">
     <h3>How these numbers are estimated</h3>
     <p><strong>Active time</strong> — within each session, the time between consecutive
@@ -496,6 +722,11 @@ tfoot td{font-weight:600;color:var(--ink);border-bottom:0;}
     <p><strong>Est $</strong> — API list-price equivalent of the tokens used
       (cache reads at 0.1&times;, cache writes at 1.25&times;). Not your subscription cost —
       a proxy for the raw compute value consumed.</p>
+    <p><strong>Plan check</strong> — your last-30-day API-equivalent consumption,
+      normalised to a monthly rate, against the subscription stickers. The dollar bands
+      behind "best fit" are heuristics (quotas aren't published as dollar figures);
+      days you actually hit a usage limit are the ground truth, and 3+ of them bump
+      the fit one tier up. Plan prices are editable in config.</p>
   </div>
 
   <p class="foot" id="foot"></p>
@@ -582,53 +813,162 @@ function renderModels(){
     `<td>$${fmt(T.cost,2)}</td><td>${fmt(T.out/THRU,1)}</td></tr>`;
 }
 
+function renderPlan(){
+  const P = DATA.plan;
+  document.getElementById("plannote").textContent =
+    `${P.window[0]} -> ${P.window[1]} · ${P.days} days observed · usage-limit days: ${P.hits}`;
+  let h = `<p class="verdict">${P.verdict}</p><p class="vdetail">${P.detail}</p>`;
+  h += `<table><thead><tr><th>Plan</th><th>Price</th><th>Your usage vs price</th><th></th></tr></thead><tbody>`;
+  for(const t of P.tiers){
+    const tags = [];
+    if(t.key===P.plan) tags.push('<span class="tag">your plan</span>');
+    if(t.key===P.fit) tags.push('<span class="tag best">best fit</span>');
+    h += `<tr><td class="proj">${t.label}</td>`+
+         `<td>${t.price ? "$"+fmt(t.price,0)+"/mo" : "metered"}</td>`+
+         `<td>${t.price ? fmt(P.monthly/t.price,1)+"×" : "$"+fmt(P.monthly,0)+"/mo"}</td>`+
+         `<td>${tags.join(" ")}</td></tr>`;
+  }
+  h += `</tbody></table>`;
+  document.getElementById("plancard").innerHTML = h;
+}
+
+async function drawCard(){
+  const P = DATA.plan;
+  try{
+    await Promise.all([
+      document.fonts.load('500 92px Fraunces'),
+      document.fonts.load('500 60px Fraunces'),
+      document.fonts.load('500 24px "IBM Plex Mono"'),
+      document.fonts.load('500 22px "IBM Plex Mono"'),
+      document.fonts.load('400 34px "IBM Plex Sans"'),
+    ]);
+  }catch(e){}
+  const c = document.getElementById("sharecanvas"), g = c.getContext("2d");
+  const W = c.width, H = c.height;
+  const paper="#f7f3ec", ink="#1a1815", soft="#46423b", muted="#6b665d",
+        rule="#d4cdbe", acc="#c8421f";
+  g.fillStyle = paper; g.fillRect(0,0,W,H);
+
+  g.fillStyle = acc; g.font = '500 24px "IBM Plex Mono", monospace';
+  g.fillText("CLAUDE CODE · LAST "+P.days+" DAYS", 72, 78);
+  g.fillStyle = rule; g.fillRect(72, 104, W-144, 1);
+  g.fillStyle = acc; g.fillRect(72, 101, 48, 7);
+
+  g.fillStyle = ink; g.font = '500 92px Fraunces, Georgia, serif';
+  g.fillText("$"+Math.round(P.cost).toLocaleString()+" of compute.", 72, 224);
+
+  g.fillStyle = soft; g.font = '400 34px "IBM Plex Sans", sans-serif';
+  let sub;
+  if(P.plan && P.plan!=="api"){
+    sub = "On a $"+Math.round(P.plan_price)+"/mo "+P.plan_label+" plan — "
+        + P.mult.toFixed(1)+"× the sticker.";
+  } else if(P.plan==="api"){
+    sub = "Pay-as-you-go on the API.";
+  } else {
+    sub = "API list-price equivalent, measured from local transcripts.";
+  }
+  g.fillText(sub, 72, 286);
+
+  const stats = [
+    [fmt(P.active_h,1)+" h", "ACTIVE TIME"],
+    [fmt(P.saved_a,0)+" h",  "EST. LABOR SAVED"],
+    [fmt(P.sessions,0),      "SESSIONS"],
+  ];
+  stats.forEach((s,i)=>{
+    const x = 72 + i*340;
+    g.fillStyle = muted; g.font = '500 22px "IBM Plex Mono", monospace';
+    g.fillText(s[1], x, 404);
+    g.fillStyle = ink; g.font = '500 60px Fraunces, Georgia, serif';
+    g.fillText(s[0], x, 474);
+  });
+
+  g.fillStyle = rule; g.fillRect(72, 540, W-144, 1);
+  g.fillStyle = muted; g.font = '500 22px "IBM Plex Mono", monospace';
+  g.fillText(P.window[0]+" → "+P.window[1]+" · measured locally", 72, 586);
+  g.fillStyle = acc;
+  const brand = "agentshortlist.com";
+  g.fillText(brand, W-72-g.measureText(brand).width, 586);
+}
+
 let curG = "week";
 let curProject = null;
+let curTok = "out";
 
 function renderChart(){
   const g = curG;
   const recs = curProject ? DATA.records.filter(r=>r.project===curProject) : DATA.records;
-  const buckets = {};
+  const hrs = {}, toks = {};
   for(const r of recs){
     const k = bucketKey(r.date,g);
-    buckets[k] = (buckets[k]||0) + r.minutes/60;
+    hrs[k] = (hrs[k]||0) + r.minutes/60;
+    toks[k] = (toks[k]||0) + (curTok==="total" ? r.total_tokens : r.out_tokens);
   }
-  const keys = Object.keys(buckets).sort();
-  const vals = keys.map(k=>buckets[k]);
-  const W=1100, H=320, padL=44, padB=46, padT=12, padR=8;
-  const maxV = Math.max(1, ...vals);
+  const keys = Object.keys(hrs).sort();
+  const hv = keys.map(k=>hrs[k]);
+  const tv = keys.map(k=>toks[k]);
+  const W=1100, H=320, padL=44, padB=46, padT=26, padR=58;
+  const maxH = Math.max(1, ...hv);
+  const maxT = Math.max(1, ...tv);
   const n = keys.length || 1;
   const bw = (W-padL-padR)/n;
   const x = i => padL + i*bw;
-  const y = v => padT + (1-v/maxV)*(H-padT-padB);
+  const yH = v => padT + (1-v/maxH)*(H-padT-padB);
+  const yT = v => padT + (1-v/maxT)*(H-padT-padB);
   const barw = Math.max(1, bw*0.7);
   const off = (bw-barw)/2;
   const step = Math.ceil(n/14);
   const lbl = k => (g==="month") ? k : k.slice(5);
   const gridN=4;
-  let grid="";
+
+  // left axis (hours) + gridlines, and right axis (tokens)
+  let grid="", raxis="";
   for(let i=0;i<=gridN;i++){
-    const v=maxV*i/gridN, yy=y(v);
+    const yy=yH(maxH*i/gridN);
     grid += `<line class="axis" x1="${padL}" y1="${yy}" x2="${W-padR}" y2="${yy}"/>`+
-            `<text class="tick" x="${padL-6}" y="${yy+3}" text-anchor="end">${v.toFixed(0)}</text>`;
+            `<text class="tick" x="${padL-6}" y="${yy+3}" text-anchor="end">${(maxH*i/gridN).toFixed(0)}</text>`;
+    const yt=yT(maxT*i/gridN);
+    raxis += `<text class="tick" x="${W-padR+6}" y="${yt+3}" text-anchor="start">${fmtTokens(Math.round(maxT*i/gridN))}</text>`;
   }
+
+  // hour bars
   let bars="";
   keys.forEach((k,i)=>{
-    const v=vals[i], h=(H-padT-padB)-(y(v)-padT);
-    bars += `<rect class="bar" x="${x(i)+off}" y="${y(v)}" width="${barw}" height="${Math.max(0,h)}">`+
+    const v=hv[i], h=(H-padT-padB)-(yH(v)-padT);
+    bars += `<rect class="bar" x="${x(i)+off}" y="${yH(v)}" width="${barw}" height="${Math.max(0,h)}">`+
             `<title>${k}: ${v.toFixed(1)} h active</title></rect>`;
     if(i%step===0){
       bars += `<text class="barlbl" x="${x(i)+bw/2}" y="${H-padB+16}" text-anchor="middle">${lbl(k)}</text>`;
     }
   });
+
+  // token line + dots (right axis)
+  const tokName = curTok==="total" ? "tokens processed" : "output tokens";
+  const pts = keys.map((k,i)=>`${(x(i)+bw/2).toFixed(1)},${yT(tv[i]).toFixed(1)}`).join(" ");
+  let line = `<polyline class="tokline" points="${pts}"/>`;
+  let dots="";
+  keys.forEach((k,i)=>{
+    dots += `<circle class="tokdot" cx="${(x(i)+bw/2).toFixed(1)}" cy="${yT(tv[i]).toFixed(1)}" r="2.5">`+
+            `<title>${k}: ${fmtTokens(tv[i])} ${tokName}</title></circle>`;
+  });
+
+  // legend
+  const legend =
+    `<rect x="${padL}" y="4" width="11" height="11" fill="var(--ink)"/>`+
+    `<text class="barlbl" x="${padL+16}" y="13">active hours</text>`+
+    `<line class="tokline" x1="${padL+118}" y1="9" x2="${padL+140}" y2="9"/>`+
+    `<circle class="tokdot" cx="${padL+129}" cy="9" r="2.5"/>`+
+    `<text class="barlbl" x="${padL+146}" y="13">${tokName}</text>`;
+
   document.getElementById("chart").innerHTML =
     `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">`+
-    `<text class="barlbl" x="${padL-6}" y="${padT-2}" text-anchor="end">h</text>`+
-    grid+bars+`</svg>`;
+    `<text class="barlbl" x="${padL-6}" y="${padT-8}" text-anchor="end">h</text>`+
+    `<text class="barlbl" x="${W-padR+6}" y="${padT-8}" text-anchor="start">tok</text>`+
+    grid+raxis+bars+line+dots+legend+`</svg>`;
 }
 
 document.getElementById("sub").textContent =
-  `${DATA.range[0]} -> ${DATA.range[1]} · ${DATA.records.length} project-days · generated ${DATA.generated}`;
+  `${DATA.range[0]} -> ${DATA.range[1]} · ${DATA.records.length} project-days · `+
+  `dates in ${DATA.tz} · generated ${DATA.generated}`;
 document.getElementById("foot").innerHTML =
   `Read from ${DATA.files} local transcript files. Nothing was uploaded. `+
   `Re-run <code>claude_usage.py</code> to refresh.`;
@@ -653,8 +993,17 @@ function setProject(p){
 
 renderTotals();
 renderModels();
+renderPlan();
 renderChart();
 renderFilter();
+drawCard();
+
+document.getElementById("dlcard").addEventListener("click", ()=>{
+  const a = document.createElement("a");
+  a.download = "claude-code-"+DATA.plan.window[1]+".png";
+  a.href = document.getElementById("sharecanvas").toDataURL("image/png");
+  a.click();
+});
 
 document.querySelector("#ptable tbody").addEventListener("click",e=>{
   const tr = e.target.closest("tr[data-project]");
@@ -668,20 +1017,30 @@ document.querySelectorAll("#seg button").forEach(b=>{
     renderChart();
   });
 });
+document.querySelectorAll("#tokseg button").forEach(b=>{
+  b.addEventListener("click",()=>{
+    document.querySelectorAll("#tokseg button").forEach(x=>x.classList.remove("on"));
+    b.classList.add("on");
+    curTok = b.dataset.t;
+    renderChart();
+  });
+});
 </script>
 </body>
 </html>
 """
 
 
-def build_html(records, models, dmin, dmax, file_count):
+def build_html(records, models, dmin, dmax, file_count, plan):
     generated = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
     data = {
         "records": records,
         "models": models,
+        "plan": plan,
         "range": [dmin.isoformat() if dmin else "—", dmax.isoformat() if dmax else "—"],
         "generated": generated,
         "files": file_count,
+        "tz": tz_label(),
     }
     html = HTML_TEMPLATE
     html = html.replace("__DATA__", json.dumps(data, separators=(",", ":")))
@@ -702,11 +1061,17 @@ def main():
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_dashboard.html"),
                     help="Output HTML path")
     ap.add_argument("--config", default=None, help="Path to a JSON config file")
+    ap.add_argument("--plan", default=None,
+                    choices=["pro", "max5x", "max_5x", "max20x", "max_20x", "api"],
+                    help="Your Claude plan, for the plan check (overrides config)")
     ap.add_argument("--open", action="store_true", help="Open the dashboard after building")
     args = ap.parse_args()
 
-    global CONFIG
+    global CONFIG, TZ
     CONFIG = load_config(args.config)
+    if args.plan:
+        CONFIG["plan"] = {"max5x": "max_5x", "max20x": "max_20x"}.get(args.plan, args.plan)
+    TZ = resolve_tz(CONFIG.get("timezone"))
 
     if not os.path.isdir(args.base):
         print(f"Transcripts directory not found: {args.base}", file=sys.stderr)
@@ -714,16 +1079,18 @@ def main():
         sys.exit(1)
 
     file_count = len(glob.glob(os.path.join(args.base, "**", "*.jsonl"), recursive=True))
-    records, models, dmin, dmax = aggregate(args.base)
+    records, models, dmin, dmax, limit_dates = aggregate(args.base)
     if not records:
         print("No usage events found under " + args.base, file=sys.stderr)
         sys.exit(1)
 
-    html = build_html(records, models, dmin, dmax, file_count)
+    plan = build_plan_report(records, dmin, dmax, limit_dates)
+    html = build_html(records, models, dmin, dmax, file_count, plan)
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(html)
 
     print_weekly_summary(records, dmin, dmax)
+    print_plan_check(plan)
     if CONFIG.get("_loaded_from"):
         print(f"  Config: {CONFIG['_loaded_from']}")
     print(f"  Dashboard written: {args.out}")
