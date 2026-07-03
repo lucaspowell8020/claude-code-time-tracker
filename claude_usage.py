@@ -886,7 +886,7 @@ async function drawCard(){
   g.fillStyle = muted; g.font = '500 22px "IBM Plex Mono", monospace';
   g.fillText(P.window[0]+" → "+P.window[1]+" · measured locally", 72, 586);
   g.fillStyle = acc;
-  const brand = "agentshortlist.com";
+  const brand = "agentshortlist.com/claude-usage";
   g.fillText(brand, W-72-g.measureText(brand).width, 586);
 }
 
